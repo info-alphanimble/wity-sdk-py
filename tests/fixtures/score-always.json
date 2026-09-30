@@ -1,0 +1,45 @@
+{
+  "status": 200,
+  "body": {
+    "model": "wity-1",
+    "answers": {
+      "severity": {
+        "type": "score",
+        "score": 1.3489312720886515,
+        "legend": {
+          "0": "Not at all",
+          "1": "A little",
+          "2": "A lot"
+        },
+        "probabilities": {
+          "0": 0.047110145783296205,
+          "1": 0.5568484363447562,
+          "2": 0.3960414178719476
+        },
+        "confidence": 0.23833386135311085,
+        "direct_probabilities": {
+          "0": 0.006335463273248618,
+          "1": 0.020279761116913774,
+          "2": 0.9733847756098376
+        },
+        "reasoning": {
+          "mode": "always",
+          "thought": true,
+          "reason": "requested",
+          "forecast": false,
+          "thought_tokens": 128,
+          "budget_limited": false,
+          "samples": 1
+        }
+      }
+    },
+    "metadata": {
+      "reasoning": "always",
+      "elapsed_ms": 763.67
+    },
+    "usage": {
+      "input_tokens": 137,
+      "output_tokens": 0
+    }
+  }
+}

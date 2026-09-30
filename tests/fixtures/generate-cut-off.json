@@ -1,0 +1,16 @@
+{
+  "status": 200,
+  "body": {
+    "model": "wity-1",
+    "text": "{\"city",
+    "finish_reason": "length",
+    "value": null,
+    "usage": {
+      "input_tokens": 115,
+      "output_tokens": 2
+    },
+    "metadata": {
+      "elapsed_ms": 62.2
+    }
+  }
+}

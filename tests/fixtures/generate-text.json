@@ -1,0 +1,15 @@
+{
+  "status": 200,
+  "body": {
+    "model": "wity-1",
+    "text": "Thank you for bringing this to our attention; I've reviewed your account and can confirm the duplicate charge, so a refund for the extra payment is being processed and should appear in 3-5 business days.",
+    "finish_reason": "stop",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 43
+    },
+    "metadata": {
+      "elapsed_ms": 189.5
+    }
+  }
+}

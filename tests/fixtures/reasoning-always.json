@@ -1,0 +1,40 @@
+{
+  "status": 200,
+  "body": {
+    "model": "wity-1",
+    "answers": {
+      "team": {
+        "type": "choice",
+        "choice": "billing",
+        "probabilities": {
+          "billing": 0.9974022159300553,
+          "technical": 0.002136421256376306,
+          "other": 0.0004613628135684448
+        },
+        "confidence": 0.9824557449373811,
+        "direct_probabilities": {
+          "billing": 0.9999567755510276,
+          "technical": 0.0000242997694760303,
+          "other": 0.00001892467949638702
+        },
+        "reasoning": {
+          "mode": "always",
+          "thought": true,
+          "reason": "requested",
+          "forecast": false,
+          "thought_tokens": 51,
+          "budget_limited": false,
+          "samples": 1
+        }
+      }
+    },
+    "metadata": {
+      "reasoning": "always",
+      "elapsed_ms": 347.495
+    },
+    "usage": {
+      "input_tokens": 143,
+      "output_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "status": 200,
+  "body": {
+    "model": "wity-1",
+    "answers": {
+      "urgent": {
+        "type": "noul",
+        "noul": 0.9967385235620818,
+        "direct_noul": 0.9998840806278302,
+        "reasoning": {
+          "mode": "always",
+          "thought": true,
+          "reason": "requested",
+          "forecast": false,
+          "thought_tokens": 33,
+          "budget_limited": false,
+          "samples": 1
+        }
+      }
+    },
+    "metadata": {
+      "reasoning": "always",
+      "elapsed_ms": 288.058
+    },
+    "usage": {
+      "input_tokens": 123,
+      "output_tokens": 0
+    }
+  }
+}

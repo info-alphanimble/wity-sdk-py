@@ -1,0 +1,6 @@
+{
+  "status": 400,
+  "body": {
+    "error": "questions.team.instructions must be a nonempty string of at most 4000 characters"
+  }
+}

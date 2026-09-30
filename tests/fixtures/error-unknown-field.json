@@ -1,0 +1,6 @@
+{
+  "status": 400,
+  "body": {
+    "error": "A System One request requires state and questions"
+  }
+}

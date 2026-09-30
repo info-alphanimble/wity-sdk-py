@@ -1,0 +1,18 @@
+{
+  "status": 200,
+  "body": {
+    "model": "wity-1",
+    "text": "{\"city\": \"Lisbon\"}",
+    "finish_reason": "stop",
+    "value": {
+      "city": "Lisbon"
+    },
+    "usage": {
+      "input_tokens": 115,
+      "output_tokens": 9
+    },
+    "metadata": {
+      "elapsed_ms": 65
+    }
+  }
+}
