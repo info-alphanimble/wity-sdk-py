@@ -670,7 +670,7 @@ wheels = [
 ]
 
 [[package]]
-name = "wity"
+name = "wity-sdk"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

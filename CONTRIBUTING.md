@@ -34,6 +34,6 @@ Until users update, they can set `WITY_BASE_URL` to the new address.
 
 ## Publishing
 
-1. Remove the `Private :: Do Not Upload` classifier from `pyproject.toml`. PyPI refuses any upload that has it, so nobody publishes by accident.
+1. Bump the version in `pyproject.toml` and `src/wity/__init__.py`. The PyPI package name is `wity-sdk`; the import is still `wity`.
 2. Run `./check.sh`.
 3. Run `uv publish` with a PyPI token.

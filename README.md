@@ -5,10 +5,10 @@ Python client for [Wity](https://wity.alphanimble.com), the typed-decision API. 
 ## Install
 
 ```sh
-pip install wity
+pip install wity-sdk
 ```
 
-Or with uv: `uv add wity`. Needs Python 3.10 or newer. The SDK depends on `httpx` and `pydantic`.
+Or with uv: `uv add wity-sdk`. Needs Python 3.10 or newer. The SDK depends on `httpx` and `pydantic`.
 
 ## Quick start
 
