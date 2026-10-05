@@ -22,7 +22,7 @@ from ._retry import backoff, delay_before_retry, should_retry_status
 from .errors import APIConnectionError, APIError, APITimeoutError, WityError, request_id_from
 from .types import Choice, GenerateResponse, Noul, Question, Reasoning, Score, State, SystemOneResponse
 
-DEFAULT_BASE_URL = "https://wity-proxy-production-2c33.up.railway.app"
+DEFAULT_BASE_URL = "https://api.wity.alphanimble.com"
 """The production API address.
 
 If it ever moves: change this line, bump the version and publish.

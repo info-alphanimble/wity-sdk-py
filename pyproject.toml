@@ -1,6 +1,6 @@
 [project]
 name = "wity-sdk"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python SDK for the Wity typed-decision API"
 readme = "README.md"
 license = "Apache-2.0"
