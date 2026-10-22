@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from .errors import WityError
-from .types import Choice, Noul, NoulCriteria, Score
+from .types import Choice, Noul, NoulCriteria, Score, SkillQuestion
 
 
 def choice(instructions: str, criteria: Mapping[str | int, str]) -> Choice:
@@ -42,3 +42,11 @@ def score(instructions: str, levels: Sequence[str]) -> Score:
     if isinstance(levels, str):
         raise WityError("score() needs a list of levels, not a single string.")
     return Score(instructions=instructions, criteria=list(levels))
+
+
+def skill(name: str) -> SkillQuestion:
+    """Ask a saved skill's question, by its id or name. The answer adds ``skill``: which version answered, and how.
+
+    Example: ``skill("urgent-ticket")``
+    """
+    return SkillQuestion(skill=name)

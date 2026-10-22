@@ -11,16 +11,30 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, TypeVar
-from urllib.parse import urlsplit
+from typing import Any, Literal
+from urllib.parse import urlencode, urlsplit
 
 import httpx
-import pydantic
 
 from ._logging import apply_env_level, logger, safe_name
+from ._request import latency_timeout, question_json
+from ._request import parse as _parse
 from ._retry import backoff, delay_before_retry, should_retry_status
 from .errors import APIConnectionError, APIError, APITimeoutError, WityError, request_id_from
-from .types import Choice, GenerateResponse, Noul, Question, Reasoning, Score, State, SystemOneResponse
+from .sessions import AsyncSessions, Sessions
+from .skills import AsyncSkills, Skills
+from .types import (
+    ExtractResponse,
+    ExtractType,
+    GenerateResponse,
+    Question,
+    Reasoning,
+    SkillQuestion,
+    SplitResponse,
+    SplitSpec,
+    State,
+    SystemOneResponse,
+)
 
 DEFAULT_BASE_URL = "https://api.wity.alphanimble.com"
 """The production API address.
@@ -33,17 +47,38 @@ DEFAULT_TIMEOUT = 60.0
 """Seconds. Thinking can take a few seconds. Longer ``max_latency_ms`` values raise the timeout automatically."""
 DEFAULT_MAX_RETRIES = 2
 
-_LATENCY_MARGIN = 10.0
-"""Extra seconds on top of ``max_latency_ms`` for the network and Wity's own work."""
+_LONG_READ_TIMEOUT = 120.0
+"""Seconds. Split and extract read long documents. The API docs ask for at least two minutes."""
 
 _MAX_BODY_BYTES = 10 * 1024 * 1024
 """Wity's answers are a few kB. A body far bigger than that isn't a Wity answer, so the SDK stops reading."""
 
 _KNOWN_FIELDS = {
-    # Top-level fields each route accepts, from the API docs. `model` is accepted and ignored by Wity.
+    # Top-level fields each route accepts, from the API. `model` is accepted and ignored by Wity.
+    # Routes are named as in the logs: the path alone for POST, the method and path for the others.
     "/v1/systemone": frozenset({"state", "questions", "reasoning", "max_latency_ms", "image", "model"}),
     "/v1/generate": frozenset({"state", "instructions", "shape", "max_tokens", "image", "model"}),
+    "/v1/split": frozenset({"text", "split", "skill"}),
+    "/v1/extract": frozenset({"text", "fields", "types", "model"}),
+    "/v1/skills": frozenset({"name", "description", "question", "parts", "combine", "examples", "metadata", "split"}),
+    "PATCH /v1/skills/{skill}": frozenset({"name", "description", "question", "parts", "combine", "metadata", "split"}),
+    "/v1/skills/{skill}/examples": frozenset({"examples"}),
+    "/v1/sessions": frozenset({"state", "skills", "metadata", "expires_in"}),
+    "PATCH /v1/sessions/{id}": frozenset({"skills", "metadata", "expires_in"}),
+    "/v1/sessions/{id}/events": frozenset({"events"}),
+    "/v1/sessions/{id}/decide": frozenset({"questions", "reasoning", "max_latency_ms", "remember"}),
 }
+
+Method = Literal["GET", "POST", "PATCH", "DELETE"]
+
+Retry = Literal["always", "busy"]
+"""Which failures a call may retry.
+
+``"always"``: calls that change nothing, or change the same thing again (read, decide, update, delete).
+``"busy"``: calls that add something (a skill, examples, a session, events). Only 429 and 503 are retried,
+because then Wity did no work. After any other failure the call may have gone through, so a retry
+could add it twice.
+"""
 
 _KEY_PATTERN = re.compile(r"[\x21-\x7e]+")
 """Printable ASCII only, no spaces."""
@@ -104,13 +139,9 @@ def _check_number(value: object, name: str) -> float:
     return float(value)
 
 
-def _question_json(name: str, question: object) -> Any:
-    if isinstance(question, (Choice, Noul, Score)):
-        return question.model_dump(mode="json", exclude_none=True)
-    if isinstance(question, Mapping):
-        # Plain dicts are sent as they are, so question fields newer than this SDK still work.
-        return dict(question)
-    raise WityError(f"Question {safe_name(name)!r} must be built with choice(), noul() or score(), or be a dict.")
+def _route_name(method: Method, route: str) -> str:
+    """The log name of a route: the path alone for POST, the method and path for the others."""
+    return route if method == "POST" else f"{method} {route}"
 
 
 def _parse_body(raw: bytes) -> Any:
@@ -132,10 +163,13 @@ def _format_seconds(seconds: float) -> str:
 class _Prepared:
     """One request, ready to send. The same bytes go out on every retry."""
 
+    method: Method
     route: str
+    """The log name, like ``GET /v1/skills/{skill}``. Never filled in with ids."""
     url: str
-    payload: bytes
+    payload: bytes | None
     timeout: float
+    retry: Retry
     summary: str
     """What debug logs about the request. Never the key, never the ``state`` text."""
     unknown_note: str | None
@@ -200,19 +234,18 @@ class _BaseClient:
     def __repr__(self) -> str:
         return f"{type(self).__name__}(base_url={self.base_url!r})"
 
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._api_key.get()}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+    def _headers(self, has_body: bool = True) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {self._api_key.get()}", "Accept": "application/json"}
+        if has_body:
+            headers["Content-Type"] = "application/json"
+        return headers
 
     # -- building requests ---------------------------------------------------
 
     def _prepare_system_one(
         self,
         state: State,
-        questions: Mapping[str, Question | Mapping[str, Any]],
+        questions: Mapping[str, Question | SkillQuestion | Mapping[str, Any]],
         reasoning: Reasoning | None,
         max_latency_ms: float | None,
         image: str | None,
@@ -222,18 +255,13 @@ class _BaseClient:
             raise WityError("questions must be a dict of question name to question, for example {'team': choice(...)}.")
         body = {
             "state": state,
-            "questions": {name: _question_json(name, q) for name, q in questions.items()},
+            "questions": {name: question_json(name, q) for name, q in questions.items()},
             "reasoning": reasoning,
             "max_latency_ms": max_latency_ms,
             "image": image,
         }
         summary = f"questions={list(questions)!r} reasoning={reasoning or 'default'!r}"
-        # Give Wity the full time it was allowed, plus room for the network.
-        min_timeout = 0.0
-        latency = max_latency_ms
-        if isinstance(latency, (int, float)) and not isinstance(latency, bool) and math.isfinite(latency):
-            min_timeout = latency / 1000 + _LATENCY_MARGIN
-        return self._prepare("/v1/systemone", body, extra_body, summary, min_timeout)
+        return self._prepare("/v1/systemone", body, extra_body, summary, latency_timeout(max_latency_ms))
 
     def _prepare_generate(
         self,
@@ -254,39 +282,92 @@ class _BaseClient:
         summary = f"shape={shape is not None} max_tokens={max_tokens or 'default'!r}"
         return self._prepare("/v1/generate", body, extra_body, summary, 0.0)
 
+    def _prepare_split(
+        self,
+        text: str,
+        split: str | SplitSpec | Mapping[str, Any] | None,
+        skill: str | None,
+        extra_body: Mapping[str, Any] | None,
+    ) -> _Prepared:
+        if split is not None and skill is not None:
+            raise WityError("Give split or skill, not both. A split skill brings its own split.")
+        kind = (
+            "skill"
+            if skill is not None
+            else "default"
+            if split is None
+            else "words"
+            if isinstance(split, str)
+            else "spec"
+        )
+        if isinstance(split, SplitSpec):
+            split = split.model_dump(mode="json", exclude_none=True)
+        body = {"text": text, "split": split, "skill": skill}
+        chars = len(text) if isinstance(text, str) else None
+        return self._prepare("/v1/split", body, extra_body, f"chars={chars} split={kind}", _LONG_READ_TIMEOUT)
+
+    def _prepare_extract(
+        self,
+        text: str,
+        fields: Mapping[str, str],
+        types: Mapping[str, ExtractType] | None,
+        extra_body: Mapping[str, Any] | None,
+    ) -> _Prepared:
+        body = {"text": text, "fields": fields, "types": types}
+        chars = len(text) if isinstance(text, str) else None
+        names = list(fields) if isinstance(fields, Mapping) else None
+        return self._prepare("/v1/extract", body, extra_body, f"chars={chars} fields={names!r}", _LONG_READ_TIMEOUT)
+
     def _prepare(
         self,
         route: str,
-        fields: dict[str, Any],
+        fields: dict[str, Any] | None,
         extra_body: Mapping[str, Any] | None,
         summary: str,
         min_timeout: float,
+        *,
+        method: Method = "POST",
+        path: str | None = None,
+        query: Mapping[str, str | int | None] | None = None,
+        retry: Retry = "always",
     ) -> _Prepared:
-        body = {name: value for name, value in fields.items() if value is not None}
-        if extra_body is not None:
-            if not isinstance(extra_body, Mapping):
-                raise WityError("extra_body must be a dict.")
-            body.update(extra_body)
+        """Build one request. ``route`` is the path with placeholders, ``path`` the real one with ids filled in."""
+        name = _route_name(method, route)
+        payload: bytes | None = None
+        unknown_note = None
+        if fields is not None:
+            body = {key: value for key, value in fields.items() if value is not None}
+            if extra_body is not None:
+                if not isinstance(extra_body, Mapping):
+                    raise WityError("extra_body must be a dict.")
+                body.update(extra_body)
 
-        # Fields in extra_body are sent, so new API fields work without an SDK update.
-        # They're never sent silently: a warning names them, and so does a 400 error.
-        unknown = [safe_name(name) for name in body if name not in _KNOWN_FIELDS[route]]
-        unknown_note = f"The request included fields Wity may not know: {', '.join(unknown)}." if unknown else None
-        if unknown_note:
-            logger.warning("%s: %s Check for typos.", route, unknown_note)
+            # Fields in extra_body are sent, so new API fields work without an SDK update.
+            # They're never sent silently: a warning names them, and so does a 400 error.
+            known = _KNOWN_FIELDS.get(name)
+            unknown = [safe_name(key) for key in body if known is not None and key not in known]
+            unknown_note = f"The request included fields Wity may not know: {', '.join(unknown)}." if unknown else None
+            if unknown_note:
+                logger.warning("%s: %s Check for typos.", name, unknown_note)
 
-        try:
-            payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode()
-        except (TypeError, ValueError, RecursionError) as err:
-            raise WityError(
-                "The request can't be turned into JSON. Look for NaN, sets, dates or loops in state."
-            ) from err
+            try:
+                payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode()
+            except (TypeError, ValueError, RecursionError) as err:
+                raise WityError(
+                    "The request can't be turned into JSON. Look for NaN, sets, dates or loops in state."
+                ) from err
 
+        params = {key: value for key, value in (query or {}).items() if value is not None}
+        url = f"{self.base_url}{path or route}"
+        if params:
+            url = f"{url}?{urlencode(params)}"
         return _Prepared(
-            route=route,
-            url=f"{self.base_url}{route}",
+            method=method,
+            route=name,
+            url=url,
             payload=payload,
             timeout=max(self.timeout, min_timeout),
+            retry=retry,
             summary=summary,
             unknown_note=unknown_note,
         )
@@ -295,12 +376,12 @@ class _BaseClient:
 
     def _log_sending(self, p: _Prepared, attempt: int) -> None:
         logger.debug(
-            "%s: sending (attempt %d of %d) url=%s bytes=%d %s",
+            "%s: sending (attempt %d of %d) url=%s bytes=%s %s",
             p.route,
             attempt + 1,
             self.max_retries + 1,
             p.url,
-            len(p.payload),
+            len(p.payload) if p.payload is not None else 0,
             p.summary,
         )
 
@@ -310,7 +391,9 @@ class _BaseClient:
     def _delay_after_failed_send(self, p: _Prepared, attempt: int, err: WityError, started: float) -> float:
         """Seconds to wait before retrying a broken connection. Raises ``err`` if it shouldn't be retried."""
         ms = round((time.monotonic() - started) * 1000)
-        if isinstance(err, APIConnectionError) and attempt < self.max_retries:
+        if isinstance(err, APIConnectionError) and attempt < self.max_retries and p.retry == "busy":
+            logger.info("%s: not retrying. This call adds something, and it may have gone through.", p.route)
+        elif isinstance(err, APIConnectionError) and attempt < self.max_retries:
             delay = backoff(attempt)
             logger.info(
                 "%s: connection failed after %d ms. Retrying in %d ms (%s). Cause: %s",
@@ -336,7 +419,16 @@ class _BaseClient:
             data: dict[str, Any] = reply.data
             return data
 
-        if attempt < self.max_retries and should_retry_status(reply.status):
+        # 429 and 503 mean Wity did no work, so even a call that adds something can go again.
+        safe_to_retry = p.retry == "always" or reply.status in (429, 503)
+        if attempt < self.max_retries and should_retry_status(reply.status) and not safe_to_retry:
+            logger.info(
+                "%s: got %d. Not retrying: this call adds something, and it may have gone through. request_id=%s",
+                p.route,
+                reply.status,
+                request_id,
+            )
+        elif attempt < self.max_retries and should_retry_status(reply.status):
             delay = delay_before_retry(attempt, reply.headers)
             if delay is not None:
                 logger.info(
@@ -373,18 +465,6 @@ class _BaseClient:
         )
 
 
-_Model = TypeVar("_Model", bound=pydantic.BaseModel)
-
-
-def _parse(model: type[_Model], data: dict[str, Any]) -> _Model:
-    try:
-        return model.model_validate(data)
-    except pydantic.ValidationError as err:
-        raise WityError(
-            "Wity's answer doesn't have the shape this SDK expects. Update the wity package, or check WITY_BASE_URL."
-        ) from err
-
-
 class WityClient(_BaseClient):
     """Client for the Wity API. Use it on a server only: it holds your API key.
 
@@ -413,6 +493,10 @@ class WityClient(_BaseClient):
         super().__init__(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
         self._owns_http = http_client is None
         self._http = http_client if http_client is not None else httpx.Client()
+        self.skills = Skills(self)
+        """Create, teach and manage skills."""
+        self.sessions = Sessions(self)
+        """Keep a state on Wity's side, add to it with events, and decide on it."""
 
     def __enter__(self) -> WityClient:
         return self
@@ -429,7 +513,7 @@ class WityClient(_BaseClient):
         self,
         *,
         state: State,
-        questions: Mapping[str, Question | Mapping[str, Any]],
+        questions: Mapping[str, Question | SkillQuestion | Mapping[str, Any]],
         reasoning: Reasoning | None = None,
         max_latency_ms: float | None = None,
         image: str | None = None,
@@ -441,7 +525,7 @@ class WityClient(_BaseClient):
 
         Args:
             state: What the decision is about. Dicts and lists are read as JSON.
-            questions: Questions by a name you choose, built with ``choice``, ``noul`` or ``score``.
+            questions: Questions by a name you choose, built with ``choice``, ``noul``, ``score`` or ``skill``.
             reasoning: ``"auto"`` (the API default), ``"off"`` or ``"always"``.
             max_latency_ms: Time limit per request, 200 to 120000 ms. Thinking stops early to meet it.
                 The SDK waits at least this long plus 10 s before timing out.
@@ -449,7 +533,7 @@ class WityClient(_BaseClient):
             extra_body: Extra top-level fields to send, for API fields newer than this SDK.
         """
         p = self._prepare_system_one(state, questions, reasoning, max_latency_ms, image, extra_body)
-        return _parse(SystemOneResponse, self._post(p))
+        return _parse(SystemOneResponse, self._request(p))
 
     def generate(
         self,
@@ -472,9 +556,54 @@ class WityClient(_BaseClient):
             extra_body: Extra top-level fields to send, for API fields newer than this SDK.
         """
         p = self._prepare_generate(instructions, state, shape, max_tokens, image, extra_body)
-        return _parse(GenerateResponse, self._post(p))
+        return _parse(GenerateResponse, self._request(p))
 
-    def _post(self, p: _Prepared) -> dict[str, Any]:
+    def split(
+        self,
+        *,
+        text: str,
+        split: str | SplitSpec | Mapping[str, Any] | None = None,
+        skill: str | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> SplitResponse:
+        """Cut ``text`` into whole items: emails, clauses, messages, entries.
+
+        Every item is an exact slice: ``text[item.start:item.end] == item.text``.
+        The SDK waits at least two minutes, even with a shorter ``timeout``.
+
+        Args:
+            text: The document. 1 to 60,000 characters of plain text.
+            split: What one item is: plain words (3 to 300 characters, like ``"one item per email"``)
+                or a ``SplitSpec``. The API default is ``"one item per paragraph"``.
+            skill: Instead of ``split``: a split skill's id or name. Give one or the other, not both.
+            extra_body: Extra top-level fields to send, for API fields newer than this SDK.
+        """
+        p = self._prepare_split(text, split, skill, extra_body)
+        return _parse(SplitResponse, self._request(p))
+
+    def extract(
+        self,
+        *,
+        text: str,
+        fields: Mapping[str, str],
+        types: Mapping[str, ExtractType] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> ExtractResponse:
+        """Pull named fields out of ``text``. Each value comes back as written, with its position and a confidence.
+
+        The SDK waits at least two minutes, even with a shorter ``timeout``.
+
+        Args:
+            text: The document. 1 to 60,000 characters of plain text.
+            fields: 1 to 16 fields: name (up to 64 characters) to what it asks for, in plain words (up to 300).
+            types: Field name to ``"date"`` (YYYY-MM-DD), ``"duration"`` or ``"number"``, for fields that should
+                come back normalised.
+            extra_body: Extra top-level fields to send, for API fields newer than this SDK.
+        """
+        p = self._prepare_extract(text, fields, types, extra_body)
+        return _parse(ExtractResponse, self._request(p))
+
+    def _request(self, p: _Prepared) -> dict[str, Any]:
         attempt = 0
         while True:
             self._log_sending(p, attempt)
@@ -495,7 +624,11 @@ class WityClient(_BaseClient):
         """One attempt: send the request and read the whole answer."""
         deadline = time.monotonic() + p.timeout
         request = self._http.build_request(
-            "POST", p.url, content=p.payload, headers=self._headers(), timeout=httpx.Timeout(p.timeout)
+            p.method,
+            p.url,
+            content=p.payload,
+            headers=self._headers(p.payload is not None),
+            timeout=httpx.Timeout(p.timeout),
         )
         try:
             # Never follow a redirect: it could carry the key to an address nobody chose.
@@ -540,6 +673,10 @@ class AsyncWityClient(_BaseClient):
         super().__init__(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
         self._owns_http = http_client is None
         self._http = http_client if http_client is not None else httpx.AsyncClient()
+        self.skills = AsyncSkills(self)
+        """Create, teach and manage skills."""
+        self.sessions = AsyncSessions(self)
+        """Keep a state on Wity's side, add to it with events, and decide on it."""
 
     async def __aenter__(self) -> AsyncWityClient:
         return self
@@ -556,7 +693,7 @@ class AsyncWityClient(_BaseClient):
         self,
         *,
         state: State,
-        questions: Mapping[str, Question | Mapping[str, Any]],
+        questions: Mapping[str, Question | SkillQuestion | Mapping[str, Any]],
         reasoning: Reasoning | None = None,
         max_latency_ms: float | None = None,
         image: str | None = None,
@@ -564,7 +701,7 @@ class AsyncWityClient(_BaseClient):
     ) -> SystemOneResponse:
         """Ask one or more typed questions about ``state``. Same arguments as ``WityClient.system_one``."""
         p = self._prepare_system_one(state, questions, reasoning, max_latency_ms, image, extra_body)
-        return _parse(SystemOneResponse, await self._post(p))
+        return _parse(SystemOneResponse, await self._request(p))
 
     async def generate(
         self,
@@ -578,9 +715,33 @@ class AsyncWityClient(_BaseClient):
     ) -> GenerateResponse:
         """Write short text, or JSON that matches ``shape``. Same arguments as ``WityClient.generate``."""
         p = self._prepare_generate(instructions, state, shape, max_tokens, image, extra_body)
-        return _parse(GenerateResponse, await self._post(p))
+        return _parse(GenerateResponse, await self._request(p))
 
-    async def _post(self, p: _Prepared) -> dict[str, Any]:
+    async def split(
+        self,
+        *,
+        text: str,
+        split: str | SplitSpec | Mapping[str, Any] | None = None,
+        skill: str | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> SplitResponse:
+        """Cut ``text`` into whole items. Same arguments as ``WityClient.split``."""
+        p = self._prepare_split(text, split, skill, extra_body)
+        return _parse(SplitResponse, await self._request(p))
+
+    async def extract(
+        self,
+        *,
+        text: str,
+        fields: Mapping[str, str],
+        types: Mapping[str, ExtractType] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> ExtractResponse:
+        """Pull named fields out of ``text``. Same arguments as ``WityClient.extract``."""
+        p = self._prepare_extract(text, fields, types, extra_body)
+        return _parse(ExtractResponse, await self._request(p))
+
+    async def _request(self, p: _Prepared) -> dict[str, Any]:
         attempt = 0
         while True:
             self._log_sending(p, attempt)
@@ -601,7 +762,11 @@ class AsyncWityClient(_BaseClient):
         """One attempt: send the request and read the whole answer."""
         deadline = time.monotonic() + p.timeout
         request = self._http.build_request(
-            "POST", p.url, content=p.payload, headers=self._headers(), timeout=httpx.Timeout(p.timeout)
+            p.method,
+            p.url,
+            content=p.payload,
+            headers=self._headers(p.payload is not None),
+            timeout=httpx.Timeout(p.timeout),
         )
         try:
             # Never follow a redirect: it could carry the key to an address nobody chose.

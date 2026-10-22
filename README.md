@@ -1,6 +1,6 @@
 # Wity Python SDK
 
-Python client for [Wity](https://wity.alphanimble.com), the typed-decision API. Send some text and a few questions with fixed options. Get back a probability for every option.
+Python client for [Wity](https://wity.alphanimble.com), the typed-decision API. Send some text and a few questions with fixed options. Get back a probability for every option. It also splits documents into items, extracts fields, and teaches skills from your examples.
 
 ## Install
 
@@ -140,6 +140,122 @@ origin.value  # {"city": "Lisbon"}
 - Only input tokens are billed.
 - Check generated text before acting on it. It can state things that aren't in `state`.
 
+## Split
+
+`split` cuts a document into whole items: emails from a thread, clauses from a contract, messages, log entries. Every item is an exact slice of the text you sent. Nothing is rewritten or dropped.
+
+```python
+res = client.split(text=thread, split="one item per email")
+
+for item in res.items:
+    assert thread[item.start : item.end] == item.text
+```
+
+- `split` says what one item is, in plain words (3 to 300 characters). The default is `"one item per paragraph"`.
+- For more control, pass a spec: `SplitSpec(unit="clause", starts_at=["a numbered heading like 4. Liability."])`. It also takes `keep_together` and `never_split`.
+- `sentence`, `line`, `bullet`, `speaker turn` and `paragraph` are cut by rule. Then `how` is `"rule:<kind>"` instead of `"model"`.
+- `text` can be up to 60,000 characters. The SDK waits at least two minutes for split, even if `timeout` is shorter.
+- A common pattern: split, then ask one question per item, with the item's text as `state`.
+
+To split an unusual format the way you would, teach a [split skill](#skills) and pass `skill=` instead of `split=`. Give one or the other, not both.
+
+## Extract
+
+`extract` pulls named fields out of a document. Each value comes back as written, with its position and a confidence.
+
+```python
+res = client.extract(
+    text=contract,
+    fields={"party": "a company that signs the agreement", "effective date": "when it takes effect"},
+    types={"effective date": "date"},
+)
+
+res.fields["party"]  # ["Kestrel Foods Ltd.", "Brightmart Inc."]
+res.entities[0]  # ExtractEntity(field="party", text="Kestrel Foods Ltd.", start=112, end=130, confidence=0.98)
+```
+
+- `fields` maps each field name to what it asks for, in plain words. Give 1 to 16 fields. Each field returns up to 30 values, and `[]` when the document has none.
+- `types` makes a field come back normalised: `"date"` (YYYY-MM-DD), `"duration"` or `"number"`. The offsets still mark where the value was read.
+- `confidence` is from 0 to 1. It is not calibrated.
+- `text` can be up to 60,000 characters. The SDK waits at least two minutes for extract.
+
+## Skills
+
+A skill saves a question once and learns your definition from labelled examples. Make it once, then use it by name:
+
+```python
+from wity import noul, skill
+
+client.skills.create(
+    name="urgent-ticket",
+    question=noul("Does this support ticket need a reply within the hour?"),
+    examples=[
+        {"state": "Checkout is down for every customer.", "answer": "yes"},
+        {"state": "Can you change my invoice address?", "answer": "no"},
+        # ...
+    ],
+)
+
+res = client.system_one(state=ticket, questions={"urgent": skill("urgent-ticket")})
+res.answers["urgent"].skill  # SkillInfo(name="urgent-ticket", version=3, answered_by="examples", active=True, ...)
+```
+
+- A skill's question is a `noul` or a `choice`. Learning starts at 8 examples, with at least 2 for each of two answers.
+- The skill uses what it learned only when that beats the plain question on examples it held back. Then `active` is `True`, and `quality` on the skill shows the accuracy with and without it.
+- `parts` splits a hard yes/no question into simple ones, and `combine` joins them with a rule like `"not same_state and amount"`. `parts="auto"` lets Wity write them.
+- Skill questions are answered in fast mode.
+
+Every method that takes a skill accepts its id (`sk_...`) or its name:
+
+| Call | Does |
+|---|---|
+| `skills.create(name=..., question=..., ...)` | Make a decision skill. Returns a `DecisionSkill` |
+| `skills.create(name=..., split=..., examples=...)` | Make a split skill. Examples are `{"text", "items"}` or `{"text", "starts"}`. Returns a `SplitSkill` |
+| `skills.list(limit=..., after=...)` | Newest first, in pages of up to 100 |
+| `skills.get(skill)` | One skill |
+| `skills.update(skill, ...)` | A new question, parts or rule makes it learn again. `parts=None` removes the parts |
+| `skills.delete(skill)` | Delete it and its examples |
+| `skills.examples.add(skill, examples)` | Add 1 to 1,000 examples |
+| `skills.examples.list(skill, limit=..., after=...)` | Newest first |
+| `skills.examples.delete(skill, example_id)` | Remove one example |
+
+Use a split skill with `client.split(text=..., skill="my-format")`. One example already helps, and about three is enough.
+
+Reading and managing skills is free. Adding examples is billed once, on their tokens.
+
+## Sessions
+
+A session keeps the state on Wity's side. Add to it as things happen, decide when you need to, and correct answers so the skills learn.
+
+```python
+session = client.sessions.create(state="Ticket #5120 from Northwind Foods.", skills=["urgent-ticket"])
+
+client.sessions.add_events(session.id, [{"type": "update", "content": "Customer: checkout still fails."}])
+
+decision = client.sessions.decide(session.id)  # runs the session's skills
+decision.answers["urgent-ticket"]
+
+# It was wrong: this becomes an example of the skill.
+client.sessions.add_events(session.id, [{"type": "feedback", "decision_id": decision.decision_id, "answer": "no"}])
+```
+
+| Event | Does |
+|---|---|
+| `{"type": "update", "content": ...}` | Adds to what Wity reads |
+| `{"type": "state", "content": ...}` | Replaces what Wity reads from here on |
+| `{"type": "note", "content": ...}` | Kept in the log, never read |
+| `{"type": "feedback", "decision_id": ..., "answer": ...}` | The right answer to an earlier decision. Add `"question"` when it had more than one skill question |
+
+- `decide(session_id, questions=...)` asks your own questions instead of the session's skills. Its `reasoning` defaults to `"off"`. `remember=True` adds the answers to what later decisions read.
+- `context` on a decision says how many updates it read, and how many of the oldest were left out to fit.
+- `cached` is `True` when the same contents and questions were answered before. You get the same answer, for 0 tokens.
+- `sessions.list`, `get`, `update` (skills, metadata, expires_in), `delete` and `events(session_id)` (the log, oldest first) work like the skills calls.
+- Sessions expire after 7 days, unless `expires_in` says otherwise (60 s to 90 days).
+
+Decisions are billed like `system_one`. Events, reads and repeats are free.
+
+`AsyncWityClient` has the same `split`, `extract`, `skills` and `sessions`, with `await`.
+
 ## Errors
 
 Every error the SDK raises extends `WityError`:
@@ -160,6 +276,8 @@ except WityError as err:
 | `BadRequestError` | 400: the request is wrong. The message says which part. |
 | `AuthenticationError` | 401: the key is missing or wrong. |
 | `InsufficientBalanceError` | 402: the account has no balance left. |
+| `NotFoundError` | 404: no skill, session or example by that id or name. |
+| `ConflictError` | 409: a skill with that name already exists. |
 | `RateLimitError` | 429: too many requests, after retries. |
 | `InternalServerError` | 5xx: a problem on Wity's side, after retries. |
 | `APIError` | Any other status. All the classes above extend it. It has `status`, `body`, `headers` and `request_id`. |
@@ -184,6 +302,7 @@ The SDK logs a warning that names each field it doesn't know. If Wity rejects th
 - 408, 429, 5xx and network failures are retried up to 2 times. The SDK waits longer each time, or as long as the `Retry-After` header asks.
 - If `Retry-After` asks for more than 60 s, the SDK raises straight away and leaves the decision to you.
 - Timeouts aren't retried. The request may already have reached Wity, and you've already waited the full timeout.
+- Calls that add something are retried only after 429 and 503, when Wity did no work. These are `skills.create`, `skills.examples.add`, `sessions.create`, `sessions.add_events` and `sessions.decide`. After any other failure the call may have gone through, so the SDK raises instead of adding it twice.
 - If the connection breaks while the answer is on its way back, Wity may already have billed the call. The retry is billed again.
 
 ```python

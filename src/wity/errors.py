@@ -17,7 +17,12 @@ class WityError(Exception):
 _MOVED_HINT = "The API address may have changed. Set WITY_BASE_URL to the new address, or update the wity package."
 
 
-def _hint_for(status: int) -> str | None:
+def _is_missing_thing(body: Any) -> bool:
+    """Wity's own "no such skill, session or example" answer, as opposed to an address that doesn't exist."""
+    return isinstance(body, dict) and body.get("code") == "not_found"
+
+
+def _hint_for(status: int, body: Any) -> str | None:
     """Extra advice added to the message for some statuses."""
     if 300 <= status < 400:
         return f"The API answered with a redirect, which this SDK never follows. {_MOVED_HINT}"
@@ -25,7 +30,7 @@ def _hint_for(status: int) -> str | None:
         return "Check WITY_API_KEY."
     if status == 402:
         return "The account has no balance left."
-    if status == 404:
+    if status == 404 and not _is_missing_thing(body):
         return _MOVED_HINT
     return None
 
@@ -93,7 +98,7 @@ class APIError(WityError):
         detail = _message_from(body)
         detail = detail.rstrip(".") if detail else None
         head = f"{status} {detail}" if detail else str(status)
-        extra = " ".join(part for part in (_hint_for(status), note) if part)
+        extra = " ".join(part for part in (_hint_for(status, body), note) if part)
         super().__init__(f"{head}. {extra}" if extra else head)
         self.status = status
         self.body = body
@@ -109,6 +114,10 @@ class APIError(WityError):
             return AuthenticationError(status, body, headers, note)
         if status == 402:
             return InsufficientBalanceError(status, body, headers, note)
+        if status == 404:
+            return NotFoundError(status, body, headers, note)
+        if status == 409:
+            return ConflictError(status, body, headers, note)
         if status == 429:
             return RateLimitError(status, body, headers, note)
         if status >= 500:
@@ -126,6 +135,14 @@ class AuthenticationError(APIError):
 
 class InsufficientBalanceError(APIError):
     """402: the account has no balance left."""
+
+
+class NotFoundError(APIError):
+    """404: no skill, session or example by that id or name. Or the API address is wrong: the message says which."""
+
+
+class ConflictError(APIError):
+    """409: a skill with that name already exists."""
 
 
 class RateLimitError(APIError):
