@@ -359,6 +359,10 @@ An option passed in code wins over the environment variable. An empty `api_key` 
 
 Pass your own `http_client` for proxies, custom certificates or HTTP/2 (`httpx.Client(http2=True)`, which needs `pip install httpx[http2]`). The SDK doesn't close a client you pass in.
 
+## Update notice
+
+When code that uses `wity-sdk` runs at a terminal, it tells you on stderr when a newer version is out, at most once a day. It asks PyPI at most once a day, in the background, so nothing waits for it. It stays quiet in CI, when output is piped, and on servers. Set `WITY_NO_UPDATE_CHECK=1` to turn it off. The same variable turns it off in every Wity package.
+
 ## Security
 
 - Keep the key on your server. Anyone who can see your browser code can read a key inside it.

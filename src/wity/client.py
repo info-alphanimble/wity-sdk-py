@@ -20,6 +20,7 @@ from ._logging import apply_env_level, logger, safe_name
 from ._request import latency_timeout, question_json
 from ._request import parse as _parse
 from ._retry import backoff, delay_before_retry, should_retry_status
+from ._update_notice import show_update_notice_once
 from .errors import APIConnectionError, APIError, APITimeoutError, WityError, request_id_from
 from .sessions import AsyncSessions, Sessions
 from .skills import AsyncSkills, Skills
@@ -230,6 +231,7 @@ class _BaseClient:
             raise WityError("max_retries must be a whole number, 0 or more.")
         self.max_retries = max_retries
         apply_env_level()
+        show_update_notice_once("wity-sdk", "pip install -U wity-sdk")
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(base_url={self.base_url!r})"

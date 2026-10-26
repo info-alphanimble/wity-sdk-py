@@ -2,6 +2,12 @@
 
 All notable changes to `wity-sdk` (Python). Versions follow [semver](https://semver.org). Before 1.0, a minor version can add features.
 
+## 0.2.1 (2026-10-26)
+
+### Added
+
+- **Update notice.** At a terminal, a client tells you on stderr when a newer `wity-sdk` is on PyPI, at most once a day. The check runs at most once a day in a background thread, so nothing waits for it. It stays quiet in CI, when output is piped, and on servers. `WITY_NO_UPDATE_CHECK=1` turns it off.
+
 ## 0.2.0 (2026-10-22)
 
 Split documents, extract fields, and teach Wity with skills and sessions. Everything below works on both `WityClient` and `AsyncWityClient`.
